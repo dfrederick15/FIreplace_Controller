@@ -44,11 +44,30 @@ const uint32_t DEFAULT_SOLENOID_PULSE_MS = 3000;
 const uint32_t DEFAULT_DEBOUNCE_MS       = 50;
 const bool     DEFAULT_AUTO_TRIGGER      = true;
 const uint32_t DEFAULT_RELAY_DELAY_MS    = 50;   // lead/lag between dir and power relays
+const bool     DEFAULT_GPIO_OVERRIDE     = false;
 
 uint32_t solenoidPulseMs = DEFAULT_SOLENOID_PULSE_MS;
 uint32_t debounceMs      = DEFAULT_DEBOUNCE_MS;
 bool     autoTrigger     = DEFAULT_AUTO_TRIGGER;
 uint32_t relayDelayMs    = DEFAULT_RELAY_DELAY_MS;
+bool     gpioOverride    = DEFAULT_GPIO_OVERRIDE;
+
+// =========================
+// Timer State Machine
+// =========================
+enum TimerMode { 
+  TIMER_IDLE = 0, 
+  TIMER_ON = 1,      // Single ON timer running
+  TIMER_CYCLE_ON = 2,  // Cycling, currently ON phase
+  TIMER_CYCLE_OFF = 3  // Cycling, currently OFF phase
+};
+
+TimerMode timerMode        = TIMER_IDLE;
+uint32_t  timerStartMs     = 0;
+uint32_t  timerDurationMs  = 0;
+uint32_t  cycleOnMs        = 0;
+uint32_t  cycleOffMs       = 0;
+uint32_t  cycleCount       = 0;
 
 // JSON config file path
 const char* CONFIG_PATH      = "/config.json";
@@ -598,6 +617,42 @@ void startReversePulse(const char* reason) {
   addLog(lastActionText + " with relayDelayMs=" + String(relayDelayMs));
 }
 
+// ============================================================================
+// Timer Update Logic
+// ============================================================================
+void updateTimers() {
+  if (timerMode == TIMER_IDLE) return;
+  
+  uint32_t now = millis();
+  uint32_t elapsed = now - timerStartMs;
+  
+  if (timerMode == TIMER_ON) {
+    // Single ON timer
+    if (elapsed >= timerDurationMs) {
+      // Timer expired
+      timerMode = TIMER_IDLE;
+      addLog("On Timer expired after " + formatDurationDDHHMMSS(timerDurationMs));
+    }
+  } else if (timerMode == TIMER_CYCLE_ON) {
+    // Cycling - currently in ON phase
+    if (elapsed >= cycleOnMs) {
+      // Switch to OFF phase
+      timerMode = TIMER_CYCLE_OFF;
+      timerStartMs = now;
+      cycleCount++;
+      addLog("Cycle Timer: ON phase complete, switching to OFF phase (cycle #" + String(cycleCount) + ")");
+    }
+  } else if (timerMode == TIMER_CYCLE_OFF) {
+    // Cycling - currently in OFF phase
+    if (elapsed >= cycleOffMs) {
+      // Switch back to ON phase
+      timerMode = TIMER_CYCLE_ON;
+      timerStartMs = now;
+      addLog("Cycle Timer: OFF phase complete, switching to ON phase");
+    }
+  }
+}
+
 void updateSolenoidPulse() {
   if (!actionInProgress) return;
 
@@ -659,7 +714,11 @@ void saveConfigToSPIFFS() {
   f.print("  \"solenoidPulseMs\": "); f.print(solenoidPulseMs); f.print(",\n");
   f.print("  \"debounceMs\": ");      f.print(debounceMs);      f.print(",\n");
   f.print("  \"autoTrigger\": ");     f.print(autoTrigger ? "true" : "false"); f.print(",\n");
-  f.print("  \"relayDelayMs\": ");    f.print(relayDelayMs);    f.print("\n");
+  f.print("  \"relayDelayMs\": ");    f.print(relayDelayMs);    f.print(",\n");
+  f.print("  \"gpioOverride\": ");    f.print(gpioOverride ? "true" : "false"); f.print(",\n");
+  f.print("  \"timerDurationMs\": "); f.print(timerDurationMs); f.print(",\n");
+  f.print("  \"cycleOnMs\": ");       f.print(cycleOnMs);       f.print(",\n");
+  f.print("  \"cycleOffMs\": ");      f.print(cycleOffMs);      f.print("\n");
   f.print("}\n");
   f.close();
 
@@ -674,6 +733,7 @@ void loadConfigFromSPIFFS() {
     debounceMs      = DEFAULT_DEBOUNCE_MS;
     autoTrigger     = DEFAULT_AUTO_TRIGGER;
     relayDelayMs    = DEFAULT_RELAY_DELAY_MS;
+    gpioOverride    = DEFAULT_GPIO_OVERRIDE;
     return;
   }
 
@@ -683,6 +743,7 @@ void loadConfigFromSPIFFS() {
     debounceMs      = DEFAULT_DEBOUNCE_MS;
     autoTrigger     = DEFAULT_AUTO_TRIGGER;
     relayDelayMs    = DEFAULT_RELAY_DELAY_MS;
+    gpioOverride    = DEFAULT_GPIO_OVERRIDE;
     saveConfigToSPIFFS();
     return;
   }
@@ -694,6 +755,7 @@ void loadConfigFromSPIFFS() {
     debounceMs      = DEFAULT_DEBOUNCE_MS;
     autoTrigger     = DEFAULT_AUTO_TRIGGER;
     relayDelayMs    = DEFAULT_RELAY_DELAY_MS;
+    gpioOverride    = DEFAULT_GPIO_OVERRIDE;
     return;
   }
 
@@ -721,11 +783,19 @@ void loadConfigFromSPIFFS() {
   String sDeb   = getValue("debounceMs");
   String sAuto  = getValue("autoTrigger");
   String sDelay = getValue("relayDelayMs");
+  String sGpioOvr = getValue("gpioOverride");
+  String sTimerDur = getValue("timerDurationMs");
+  String sCycleOn = getValue("cycleOnMs");
+  String sCycleOff = getValue("cycleOffMs");
 
   uint32_t newPulse = sPulse.toInt();
   uint32_t newDeb   = sDeb.toInt();
   bool     newAuto  = (sAuto == "true");
   uint32_t newDelay = sDelay.length() ? (uint32_t)sDelay.toInt() : DEFAULT_RELAY_DELAY_MS;
+  bool     newGpioOvr = (sGpioOvr == "true");
+  uint32_t newTimerDur = sTimerDur.length() ? (uint32_t)sTimerDur.toInt() : 0;
+  uint32_t newCycleOn = sCycleOn.length() ? (uint32_t)sCycleOn.toInt() : 0;
+  uint32_t newCycleOff = sCycleOff.length() ? (uint32_t)sCycleOff.toInt() : 0;
 
   if (newPulse < 100 || newPulse > 20000) newPulse = DEFAULT_SOLENOID_PULSE_MS;
   if (newDeb   < 5   || newDeb   > 2000 ) newDeb   = DEFAULT_DEBOUNCE_MS;
@@ -735,11 +805,16 @@ void loadConfigFromSPIFFS() {
   debounceMs      = newDeb;
   autoTrigger     = newAuto;
   relayDelayMs    = newDelay;
+  gpioOverride    = newGpioOvr;
+  timerDurationMs = newTimerDur;
+  cycleOnMs       = newCycleOn;
+  cycleOffMs      = newCycleOff;
 
   addLog("Loaded /config.json: pulse=" + String(solenoidPulseMs)
          + " debounce=" + String(debounceMs)
          + " auto=" + String(autoTrigger ? "true" : "false")
-         + " relayDelayMs=" + String(relayDelayMs));
+         + " relayDelayMs=" + String(relayDelayMs)
+         + " gpioOverride=" + String(gpioOverride ? "true" : "false"));
 }
 
 // ============================================================================
@@ -763,11 +838,23 @@ bool ensureAuth() {
   return true;
 }
 
+bool ensureAuthOptional() {
+  // Optional auth - returns true if gpioOverride is enabled OR user is authenticated
+  if (gpioOverride) {
+    return true;  // bypass auth when GPIO override is enabled
+  }
+  if (!server.authenticate(WEB_USER, WEB_PASS)) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
 // ============================================================================
 // /api/status  (JSON for dynamic UI)
 // ============================================================================
 void handleStatusApi() {
-  if (!ensureAuth()) return;
+  if (!ensureAuthOptional()) return;
 
   uint32_t now = millis();
 
@@ -881,7 +968,36 @@ void handleStatusApi() {
   json += "\"on_time_ms\":" + String((unsigned long)effOnMs) + ",";
   json += "\"off_time_ms\":" + String((unsigned long)effOffMs) + ",";
   json += "\"on_time_str\":\"" + formatDurationDDHHMMSS(effOnMs) + "\",";
-  json += "\"off_time_str\":\"" + formatDurationDDHHMMSS(effOffMs) + "\"";
+  json += "\"off_time_str\":\"" + formatDurationDDHHMMSS(effOffMs) + "\",";
+  
+  // GPIO Override
+  json += "\"gpio_override\":" + String(gpioOverride ? "true" : "false") + ",";
+  
+  // Timer state
+  json += "\"timer_mode\":" + String(timerMode) + ",";
+  if (timerMode != TIMER_IDLE) {
+    uint32_t elapsed = now - timerStartMs;
+    if (timerMode == TIMER_ON) {
+      uint32_t remaining = (elapsed < timerDurationMs) ? (timerDurationMs - elapsed) : 0;
+      json += "\"timer_remaining_ms\":" + String(remaining) + ",";
+      json += "\"timer_remaining_str\":\"" + formatDurationDDHHMMSS(remaining) + "\",";
+    } else if (timerMode == TIMER_CYCLE_ON) {
+      uint32_t remaining = (elapsed < cycleOnMs) ? (cycleOnMs - elapsed) : 0;
+      json += "\"cycle_phase\":\"ON\",";
+      json += "\"cycle_remaining_ms\":" + String(remaining) + ",";
+      json += "\"cycle_remaining_str\":\"" + formatDurationDDHHMMSS(remaining) + "\",";
+      json += "\"cycle_count\":" + String(cycleCount) + ",";
+    } else if (timerMode == TIMER_CYCLE_OFF) {
+      uint32_t remaining = (elapsed < cycleOffMs) ? (cycleOffMs - elapsed) : 0;
+      json += "\"cycle_phase\":\"OFF\",";
+      json += "\"cycle_remaining_ms\":" + String(remaining) + ",";
+      json += "\"cycle_remaining_str\":\"" + formatDurationDDHHMMSS(remaining) + "\",";
+      json += "\"cycle_count\":" + String(cycleCount) + ",";
+    }
+  }
+  json += "\"timer_duration_ms\":" + String(timerDurationMs) + ",";
+  json += "\"cycle_on_ms\":" + String(cycleOnMs) + ",";
+  json += "\"cycle_off_ms\":" + String(cycleOffMs);
 
   json += "}";
 
@@ -960,6 +1076,33 @@ a{color:#4ea3ff;}
 </div>
 
 <div class="card">
+  <h3>Timer Controls</h3>
+  <div class="status"><span class="label">Timer Status:</span> <span id="timerStatus">IDLE</span></div>
+  <div class="status" id="timerCountdown" style="display:none;"><span class="label">Remaining:</span> <span id="timerRemaining"></span></div>
+  <div class="status" id="cycleInfo" style="display:none;">
+    <span class="label">Phase:</span> <span id="cyclePhase"></span> |
+    <span class="label">Count:</span> <span id="cycleCount"></span>
+  </div>
+  <hr>
+  <form action="/timer" method="GET" style="margin-bottom:10px;">
+    <label>On Timer Duration (DD:HH:MM:SS):</label><br>
+    <input type="text" name="duration_str" id="timerDuration" placeholder="00:00:05:00" style="width:200px;"><br><br>
+    <button class="btn-save" name="action" value="start_on">Start On Timer</button>
+  </form>
+  <hr>
+  <form action="/timer" method="GET" style="margin-bottom:10px;">
+    <label>Cycle ON Duration (DD:HH:MM:SS):</label><br>
+    <input type="text" name="on_str" id="cycleOnDur" placeholder="00:00:02:00" style="width:200px;"><br><br>
+    <label>Cycle OFF Duration (DD:HH:MM:SS):</label><br>
+    <input type="text" name="off_str" id="cycleOffDur" placeholder="00:00:01:00" style="width:200px;"><br><br>
+    <button class="btn-save" name="action" value="start_cycle">Start Cycle Timer</button>
+  </form>
+  <form action="/timer" method="GET">
+    <button class="btn-rev" name="action" value="stop">Stop Timer</button>
+  </form>
+</div>
+
+<div class="card">
   <h3>Configuration</h3>
   <form action="/config" method="GET">
     Pulse Length (ms):<br>
@@ -970,6 +1113,11 @@ a{color:#4ea3ff;}
     <input type="number" name="relay_delay" id="cfgRelayDelay" min="0" max="1000"><br><br>
     Auto Trigger:<br>
     <select name="auto" id="cfgAuto">
+      <option value="1">Enabled</option>
+      <option value="0">Disabled</option>
+    </select><br><br>
+    GPIO Override (bypass auth for status API):<br>
+    <select name="gpio_override" id="cfgGpioOverride">
       <option value="1">Enabled</option>
       <option value="0">Disabled</option>
     </select><br><br>
@@ -1104,7 +1252,49 @@ async function fetchStatus() {
       if (ge('cfgAuto') && d.auto_trigger !== undefined) {
         ge('cfgAuto').value = d.auto_trigger ? '1' : '0';
       }
+      if (ge('cfgGpioOverride') && d.gpio_override !== undefined) {
+        ge('cfgGpioOverride').value = d.gpio_override ? '1' : '0';
+      }
       configLoaded = true;
+    }
+
+    // Timer status display
+    if (ge('timerStatus')) {
+      const timerMode = d.timer_mode || 0;
+      if (timerMode === 0) {
+        ge('timerStatus').textContent = 'IDLE';
+        if (ge('timerCountdown')) ge('timerCountdown').style.display = 'none';
+        if (ge('cycleInfo')) ge('cycleInfo').style.display = 'none';
+      } else if (timerMode === 1) {
+        ge('timerStatus').textContent = 'ON TIMER ACTIVE';
+        if (ge('timerCountdown')) ge('timerCountdown').style.display = 'block';
+        if (ge('cycleInfo')) ge('cycleInfo').style.display = 'none';
+        if (ge('timerRemaining') && d.timer_remaining_str) {
+          ge('timerRemaining').textContent = d.timer_remaining_str;
+        }
+      } else if (timerMode === 2) {
+        ge('timerStatus').textContent = 'CYCLE TIMER (ON PHASE)';
+        if (ge('timerCountdown')) ge('timerCountdown').style.display = 'block';
+        if (ge('cycleInfo')) ge('cycleInfo').style.display = 'block';
+        if (ge('timerRemaining') && d.cycle_remaining_str) {
+          ge('timerRemaining').textContent = d.cycle_remaining_str;
+        }
+        if (ge('cyclePhase')) ge('cyclePhase').textContent = 'ON';
+        if (ge('cycleCount') && d.cycle_count !== undefined) {
+          ge('cycleCount').textContent = d.cycle_count;
+        }
+      } else if (timerMode === 3) {
+        ge('timerStatus').textContent = 'CYCLE TIMER (OFF PHASE)';
+        if (ge('timerCountdown')) ge('timerCountdown').style.display = 'block';
+        if (ge('cycleInfo')) ge('cycleInfo').style.display = 'block';
+        if (ge('timerRemaining') && d.cycle_remaining_str) {
+          ge('timerRemaining').textContent = d.cycle_remaining_str;
+        }
+        if (ge('cyclePhase')) ge('cyclePhase').textContent = 'OFF';
+        if (ge('cycleCount') && d.cycle_count !== undefined) {
+          ge('cycleCount').textContent = d.cycle_count;
+        }
+      }
     }
 
     // Recent logs table
@@ -1224,6 +1414,62 @@ void handleCmd() {
 }
 
 // ============================================================================
+// Timer Control Endpoints
+// ============================================================================
+void handleTimerCmd() {
+  if (!ensureAuth()) return;
+  
+  if (!server.hasArg("action")) {
+    server.send(400, "text/plain", "Missing ?action= parameter");
+    return;
+  }
+  
+  String action = server.arg("action");
+  
+  if (action == "start_on") {
+    if (server.hasArg("duration_str")) {
+      String durStr = server.arg("duration_str");
+      uint32_t duration = parseDurationDDHHMMSS(durStr);
+      if (duration > 0) {
+        timerMode = TIMER_ON;
+        timerStartMs = millis();
+        timerDurationMs = duration;
+        addLog("On Timer started: duration=" + formatDurationDDHHMMSS(duration));
+        saveConfigToSPIFFS();
+      }
+    }
+  } else if (action == "start_cycle") {
+    if (server.hasArg("on_str") && server.hasArg("off_str")) {
+      String onStr = server.arg("on_str");
+      String offStr = server.arg("off_str");
+      uint32_t onDur = parseDurationDDHHMMSS(onStr);
+      uint32_t offDur = parseDurationDDHHMMSS(offStr);
+      if (onDur > 0 && offDur > 0) {
+        timerMode = TIMER_CYCLE_ON;
+        timerStartMs = millis();
+        cycleOnMs = onDur;
+        cycleOffMs = offDur;
+        cycleCount = 0;
+        addLog("Cycle Timer started: ON=" + formatDurationDDHHMMSS(onDur) + " OFF=" + formatDurationDDHHMMSS(offDur));
+        saveConfigToSPIFFS();
+      }
+    }
+  } else if (action == "stop") {
+    if (timerMode != TIMER_IDLE) {
+      addLog("Timer stopped by user");
+      timerMode = TIMER_IDLE;
+      cycleCount = 0;
+    }
+  } else {
+    server.send(400, "text/plain", "Invalid action");
+    return;
+  }
+  
+  server.sendHeader("Location", "/");
+  server.send(302, "text/plain", "");
+}
+
+// ============================================================================
 // Config Save Handler
 // ============================================================================
 void handleConfig() {
@@ -1246,6 +1492,25 @@ void handleConfig() {
 
   if (server.hasArg("auto")) {
     autoTrigger = (server.arg("auto") == "1");
+  }
+
+  if (server.hasArg("gpio_override")) {
+    gpioOverride = (server.arg("gpio_override") == "1");
+  }
+  
+  if (server.hasArg("timer_duration_str")) {
+    String durStr = server.arg("timer_duration_str");
+    timerDurationMs = parseDurationDDHHMMSS(durStr);
+  }
+  
+  if (server.hasArg("cycle_on_str")) {
+    String onStr = server.arg("cycle_on_str");
+    cycleOnMs = parseDurationDDHHMMSS(onStr);
+  }
+  
+  if (server.hasArg("cycle_off_str")) {
+    String offStr = server.arg("cycle_off_str");
+    cycleOffMs = parseDurationDDHHMMSS(offStr);
   }
 
   addLog("Config updated via web; saving to SPIFFS.");
@@ -1705,6 +1970,7 @@ void setup() {
   server.on("/api/status", handleStatusApi);
   server.on("/debug",      handleDebug);
   server.on("/cmd",        handleCmd);
+  server.on("/timer",      handleTimerCmd);
   server.on("/config",     handleConfig);
 
   // OTA upload
@@ -1731,6 +1997,7 @@ void loop() {
 
   updateTriggerState();
   updateSolenoidPulse();
+  updateTimers();         // Handle timer state machine
   checkStartupCommand();  // 30s post-boot commanded-state pulse with log check
   checkLogIdleSave();     // save main log to SPIFFS after 1 minute idle
 
